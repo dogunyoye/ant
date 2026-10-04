@@ -34,8 +34,13 @@ only fetched if newer than the local copy. If there is no local copy, the downlo
 place. When a file is downloaded, the timestamp of the downloaded file is set to the remote
 timestamp.  <strong>Note</strong>: This timestamp facility only works on downloads using the HTTP
 protocol.</p>
-<p>A username and password can be specified, in which case basic ('slightly encoded plain text')
-authentication is used. This is only secure over an HTTPS link.</p>
+<p>A username and password can be specified, in which case HTTP authentication is used.
+Basic credentials are sent preemptively while Digest authentication (RFC 7616, with
+<q>MD5</q>, <q>SHA-256</q> and <q>SHA-512-256</q> algorithms) is negotiated automatically
+when the server challenges for it. Authentication is only secure over an HTTPS link.
+As an alternative to the <var>username</var>/<var>password</var> attributes, credentials
+embedded in the URL (<samp>https://user:pass@host/path</samp>) are honored when no
+explicit attributes are set.</p>
 
 <p><strong>Proxies</strong>. <em>Since Apache Ant 1.7.0</em>, Ant running on Java 5 or later
 can <a href="../proxy.html">use the proxy settings of the operating system</a> if enabled with
@@ -83,12 +88,12 @@ the request is relayed to the proxy.</p>
   </tr>
   <tr>
     <td>username</td>
-    <td>username for basic HTTP authentication</td>
+    <td>username for HTTP authentication (Basic or Digest)</td>
     <td>Yes, if <var>password</var> is set</td>
   </tr>
   <tr>
     <td>password</td>
-    <td>password for basic HTTP authentication</td>
+    <td>password for HTTP authentication (Basic or Digest)</td>
     <td>Yes if <var>username</var> is set</td>
   </tr>
   <tr>

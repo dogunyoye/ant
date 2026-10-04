@@ -1,6 +1,16 @@
 Changes from Ant 1.10.15 TO Ant 1.10.16
 =======================================
 
+Other changes:
+--------------
+
+ * <get> task now supports HTTP Digest authentication (RFC 7616).
+   When the server answers with a Digest challenge, the task retries
+   the request with a computed Digest Authorization header using the
+   configured username/password (or credentials embedded in the URL).
+   Supported algorithms are MD5, SHA-256 and SHA-512-256, including
+   their "-sess" variants.
+
 
 
 Changes from Ant 1.10.14 TO Ant 1.10.15

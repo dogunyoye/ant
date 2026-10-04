@@ -57,6 +57,34 @@
      <get src="" dest="" userAgent=""/>
   </target>
 
+  <target name="testBasicAuth">
+    <get src="http://httpbin.org/basic-auth/foo/bar" dest="basic.tmp" username="foo" password="bar" />
+  
+    <fileset id="basicauth" file="basic.tmp">
+      <contains text="&quot;authenticated&quot;: true" />
+    </fileset>
+
+    <fail message="basic auth failed">
+      <condition>
+        <resourcecount when="equal" count="0" refid="basicauth" />
+      </condition>
+    </fail>
+  </target>
+
+  <target name="testDigestAuth">
+    <get src="http://httpbin.org/digest-auth/auth-int/foo/bar" dest="digest.tmp" username="foo" password="bar" />
+  
+    <fileset id="digestauth" file="digest.tmp">
+      <contains text="&quot;authenticated&quot;: true" />
+    </fileset>
+
+    <fail message="digest auth failed">
+      <condition>
+        <resourcecount when="equal" count="0" refid="digestauth" />
+      </condition>
+    </fail>
+  </target>
+
   <target name="testUseTimestamp" depends="-90s,-timestamp" />
 
   <target name="-90s">
@@ -128,7 +156,8 @@
 
   <target name="cleanup">
     <delete>
-      <fileset dir="${basedir}" includes="get.tmp" />
+      <fileset dir="${basedir}"
+               includes="get.tmp,basic.tmp,digest.tmp" />
     </delete>
   </target>
 

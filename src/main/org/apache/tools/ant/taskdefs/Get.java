@@ -26,9 +26,17 @@ import java.io.PrintStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.zip.GZIPInputStream;
 
@@ -389,7 +397,7 @@ public class Get extends Task {
     }
 
     /**
-     * Username for basic auth.
+     * Username for HTTP authentication (Basic or Digest).
      *
      * @param u username for authentication
      */
@@ -398,7 +406,7 @@ public class Get extends Task {
     }
 
     /**
-     * password for the basic authentication.
+     * Password for HTTP authentication (Basic or Digest).
      *
      * @param p password for authentication
      */
@@ -554,6 +562,472 @@ public class Get extends Task {
             || responseCode == HttpURLConnection.HTTP_MOVED_TEMP
             || responseCode == HttpURLConnection.HTTP_SEE_OTHER
             || responseCode == HTTP_MOVED_TEMP;
+    }
+
+    /**
+     * Split a URL userInfo part (as returned by {@link URL#getUserInfo()})
+     * into username and password.
+     *
+     * @param userInfo the raw userInfo, may be null
+     * @return a two element array with username and password (never null
+     *         elements), or null if userInfo was null
+     */
+    public static String[] splitUserInfo(final String userInfo) {
+        if (userInfo == null) {
+            return null;
+        }
+        final int colon = userInfo.indexOf(':');
+        if (colon >= 0) {
+            return new String[] {
+                userInfo.substring(0, colon),
+                userInfo.substring(colon + 1)
+            };
+        }
+        return new String[] {userInfo, ""};
+    }
+
+    /**
+     * Resolve the effective Basic Auth credentials for a request.
+     *
+     * <p>Explicit {@code username}/{@code password} attributes win;
+     * when neither is set the credentials embedded in the URL
+     * ({@code http://user:pass@host/...}) are used as a fallback.</p>
+     *
+     * @param source the URL being fetched, may carry userInfo
+     * @param username the configured username, may be null
+     * @param password the configured password, may be null
+     * @return {@code "user:password"} or null if no credentials available
+     */
+    public static String getBasicAuthCredentials(final URL source,
+                                          final String username,
+                                          final String password) {
+        if (username != null || password != null) {
+            return (username != null ? username : "")
+                + ":" + (password != null ? password : "");
+        }
+        if (source != null) {
+            final String[] parts = splitUserInfo(source.getUserInfo());
+            if (parts != null) {
+                return parts[0] + ":" + parts[1];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Encode credentials per RFC 7617 (ISO-8859-1 bytes, Base64).
+     *
+     * @param credentials {@code "user:password"}
+     * @return Base64 encoded value, or null if credentials was null
+     */
+    public static String encodeBasicAuth(final String credentials) {
+        if (credentials == null) {
+            return null;
+        }
+        return new Base64Converter()
+            .encode(credentials.getBytes(StandardCharsets.ISO_8859_1));
+    }
+
+    /**
+     * Parse an HTTP Digest challenge (the value of a
+     * {@code WWW-Authenticate: Digest ...} header) into its parameters.
+     *
+     * <p>Parameter names are lower-cased; surrounding quotes are removed
+     * from values.</p>
+     *
+     * @param header the header value, may be null
+     * @return map of challenge parameters, or null if the value is not
+     *         a Digest challenge
+     */
+    public static Map<String, String> parseDigestChallenge(final String header) {
+        if (header == null) {
+            return null;
+        }
+        String s = header.trim();
+        if (s.length() <= 6 || !s.regionMatches(true, 0, "Digest", 0, 6)
+            || !Character.isWhitespace(s.charAt(6))) {
+            return null;
+        }
+        s = s.substring(6).trim();
+        final Map<String, String> params = new LinkedHashMap<>();
+        int i = 0;
+        final int n = s.length();
+        while (i < n) {
+            while (i < n && (s.charAt(i) == ','
+                || Character.isWhitespace(s.charAt(i)))) {
+                i++;
+            }
+            if (i >= n) {
+                break;
+            }
+            final int eq = s.indexOf('=', i);
+            if (eq < 0) {
+                break;
+            }
+            final String key = s.substring(i, eq).trim()
+                .toLowerCase(Locale.ENGLISH);
+            i = eq + 1;
+            while (i < n && Character.isWhitespace(s.charAt(i))) {
+                i++;
+            }
+            final String value;
+            if (i < n && s.charAt(i) == '"') {
+                i++;
+                final StringBuilder sb = new StringBuilder();
+                while (i < n) {
+                    final char c = s.charAt(i);
+                    if (c == '\\' && i + 1 < n) {
+                        sb.append(s.charAt(i + 1));
+                        i += 2;
+                    } else if (c == '"') {
+                        i++;
+                        break;
+                    } else {
+                        sb.append(c);
+                        i++;
+                    }
+                }
+                value = sb.toString();
+            } else {
+                int j = i;
+                while (j < n && s.charAt(j) != ',') {
+                    j++;
+                }
+                value = s.substring(i, j).trim();
+                i = j;
+            }
+            if (!key.isEmpty()) {
+                params.put(key, value);
+            }
+        }
+        return params;
+    }
+
+    /**
+     * Collect the values of all {@code WWW-Authenticate} response headers.
+     *
+     * @param connection the (connected) connection to inspect
+     * @return header values, never null but possibly empty
+     */
+    static List<String> getAuthenticateHeaders(final URLConnection connection) {
+        final List<String> result = new ArrayList<>();
+        final Map<String, List<String>> fields = connection.getHeaderFields();
+        if (fields != null) {
+            for (final Map.Entry<String, List<String>> entry
+                    : fields.entrySet()) {
+                if (entry.getKey() != null
+                    && entry.getKey().equalsIgnoreCase("WWW-Authenticate")
+                    && entry.getValue() != null) {
+                    result.addAll(entry.getValue());
+                }
+            }
+        }
+        if (result.isEmpty()) {
+            final String single =
+                connection.getHeaderField("WWW-Authenticate");
+            if (single != null) {
+                result.add(single);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Find the Digest challenge among {@code WWW-Authenticate} headers.
+     *
+     * @param challenges header values, may be null
+     * @return the Digest challenge value, or null if there is none
+     */
+    public static String selectDigestChallenge(final List<String> challenges) {
+        if (challenges == null) {
+            return null;
+        }
+        for (final String challenge : challenges) {
+            if (challenge != null) {
+                final String trimmed = challenge.trim();
+                if (trimmed.length() > 6
+                    && trimmed.regionMatches(true, 0, "Digest", 0, 6)
+                    && Character.isWhitespace(trimmed.charAt(6))) {
+                    return challenge;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Build the request path used as Digest {@code uri} parameter.
+     *
+     * @param url the URL being fetched
+     * @return path plus query string, or {@code "/"} if there is no path
+     */
+    public static String getDigestUri(final URL url) {
+        String path = url.getPath();
+        if (path == null || path.isEmpty()) {
+            path = "/";
+        }
+        final String query = url.getQuery();
+        return query != null ? path + "?" + query : path;
+    }
+
+    /**
+     * Generate a random client nonce for Digest authentication.
+     *
+     * @return hex encoded random value
+     */
+    public static String generateCnonce() {
+        final byte[] bytes = new byte[16];
+        new SecureRandom().nextBytes(bytes);
+        return toHex(bytes);
+    }
+
+    /**
+     * Pick the quality-of-protection to answer with.
+     *
+     * @param qopOptions raw {@code qop} challenge value, may be null
+     * @return {@code "auth"}, {@code "auth-int"} or null when the server
+     *         sent no (usable) qop option
+     */
+    static String selectDigestQop(final String qopOptions) {
+        if (qopOptions == null) {
+            return null;
+        }
+        String options = qopOptions.trim();
+        if (options.length() >= 2 && options.startsWith("\"")
+            && options.endsWith("\"")) {
+            options = options.substring(1, options.length() - 1);
+        }
+        boolean auth = false;
+        boolean authInt = false;
+        for (final String token : options.split("[,\\s]+")) {
+            if (token.equalsIgnoreCase("auth")) {
+                auth = true;
+            } else if (token.equalsIgnoreCase("auth-int")) {
+                authInt = true;
+            }
+        }
+        if (auth) {
+            return "auth";
+        }
+        if (authInt) {
+            return "auth-int";
+        }
+        return null;
+    }
+
+    /**
+     * Map a Digest {@code algorithm} value to a JCA message digest name.
+     *
+     * @param algorithm challenge algorithm, may be null (means MD5)
+     * @return JCA algorithm name, or null if unsupported
+     */
+    static String toJcaDigestName(final String algorithm) {
+        if (algorithm == null) {
+            return "MD5";
+        }
+        final String normalized =
+            algorithm.trim().toUpperCase(Locale.ENGLISH);
+        if ("MD5".equals(normalized) || "MD5-SESS".equals(normalized)) {
+            return "MD5";
+        }
+        if ("SHA-256".equals(normalized)
+            || "SHA-256-SESS".equals(normalized)) {
+            return "SHA-256";
+        }
+        if ("SHA-512-256".equals(normalized)
+            || "SHA-512-256-SESS".equals(normalized)) {
+            return "SHA-512/256";
+        }
+        return null;
+    }
+
+    /**
+     * Hash data and return the lower-case hex representation.
+     *
+     * @param jcaAlgorithm JCA message digest name
+     * @param data text to hash
+     * @param charset charset used to get the bytes of the text
+     * @return hex digest, or null if the algorithm is not available
+     */
+    static String hashHex(final String jcaAlgorithm, final String data,
+                          final Charset charset) {
+        try {
+            final MessageDigest md = MessageDigest.getInstance(jcaAlgorithm);
+            return toHex(md.digest(data.getBytes(charset)));
+        } catch (final NoSuchAlgorithmException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Hex encode bytes (lower case).
+     *
+     * @param bytes bytes to encode
+     * @return hex string
+     */
+    static String toHex(final byte[] bytes) {
+        final StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (final byte b : bytes) {
+            final int v = b & 0xFF;
+            if (v < 0x10) {
+                sb.append('0');
+            }
+            sb.append(Integer.toHexString(v));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Build the value of an HTTP {@code Authorization} header answering
+     * an HTTP Digest challenge (RFC 7616).
+     *
+     * <p>Supported algorithms are {@code MD5}, {@code SHA-256} and
+     * {@code SHA-512-256} including their {@code -sess} variants.
+     * Both {@code qop} modes ({@code auth} and {@code auth-int}, the
+     * latter with an empty entity body as used by GET requests) as well
+     * as the legacy RFC 2069 mode without {@code qop} are supported.</p>
+     *
+     * @param username username to authenticate with
+     * @param password password to authenticate with
+     * @param method HTTP method, e.g. {@code "GET"}
+     * @param digestUri request path ({@code uri} parameter)
+     * @param challenge parsed challenge as returned by
+     *        {@link #parseDigestChallenge(String)}
+     * @param nonceCount nonce count ({@code nc} parameter),
+     *        e.g. {@code "00000001"}
+     * @param cnonce client nonce, see {@link #generateCnonce()}
+     * @return the header value starting with {@code "Digest "}, or null
+     *         if the challenge cannot be answered
+     */
+    public static String buildDigestAuthorization(final String username,
+            final String password, final String method,
+            final String digestUri, final Map<String, String> challenge,
+            final String nonceCount, final String cnonce) {
+        if (username == null || password == null || method == null
+            || digestUri == null || challenge == null) {
+            return null;
+        }
+        final String realm = challenge.get("realm");
+        final String nonce = challenge.get("nonce");
+        if (realm == null || nonce == null) {
+            return null;
+        }
+        final String algorithm = challenge.get("algorithm") != null
+            ? challenge.get("algorithm") : "MD5";
+        final String jcaAlgorithm = toJcaDigestName(algorithm);
+        if (jcaAlgorithm == null) {
+            return null;
+        }
+        final boolean sess = algorithm.trim().toUpperCase(Locale.ENGLISH)
+            .endsWith("-SESS");
+        Charset charset = StandardCharsets.ISO_8859_1;
+        if ("utf-8".equalsIgnoreCase(challenge.get("charset"))) {
+            charset = StandardCharsets.UTF_8;
+        }
+        final boolean userhash =
+            "true".equalsIgnoreCase(challenge.get("userhash"));
+        final String qop = selectDigestQop(challenge.get("qop"));
+        final String nc = qop != null
+            ? (nonceCount != null ? nonceCount : "00000001") : null;
+        if (qop != null && cnonce == null) {
+            return null;
+        }
+        String ha1 = hashHex(jcaAlgorithm,
+            username + ":" + realm + ":" + password, charset);
+        if (ha1 == null) {
+            return null;
+        }
+        if (sess) {
+            ha1 = hashHex(jcaAlgorithm, ha1 + ":" + nonce + ":" + cnonce,
+                StandardCharsets.ISO_8859_1);
+            if (ha1 == null) {
+                return null;
+            }
+        }
+        final String ha2;
+        if ("auth-int".equals(qop)) {
+            final String entityHash =
+                hashHex(jcaAlgorithm, "", StandardCharsets.UTF_8);
+            ha2 = hashHex(jcaAlgorithm,
+                method + ":" + digestUri + ":" + entityHash,
+                StandardCharsets.ISO_8859_1);
+        } else {
+            ha2 = hashHex(jcaAlgorithm, method + ":" + digestUri,
+                StandardCharsets.ISO_8859_1);
+        }
+        if (ha2 == null) {
+            return null;
+        }
+        final String response;
+        if (qop != null) {
+            response = hashHex(jcaAlgorithm,
+                ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop
+                    + ":" + ha2,
+                StandardCharsets.ISO_8859_1);
+        } else {
+            response = hashHex(jcaAlgorithm, ha1 + ":" + nonce + ":" + ha2,
+                StandardCharsets.ISO_8859_1);
+        }
+        if (response == null) {
+            return null;
+        }
+        final String usernameParam;
+        if (userhash) {
+            usernameParam = hashHex(jcaAlgorithm, username + ":" + realm,
+                charset);
+            if (usernameParam == null) {
+                return null;
+            }
+        } else {
+            usernameParam = username;
+        }
+        final StringBuilder sb = new StringBuilder("Digest ");
+        appendQuoted(sb, "username", usernameParam).append(", ");
+        appendQuoted(sb, "realm", realm).append(", ");
+        appendQuoted(sb, "nonce", nonce).append(", ");
+        appendQuoted(sb, "uri", digestUri).append(", ");
+        appendQuoted(sb, "response", response);
+        sb.append(", algorithm=").append(algorithm);
+        final String opaque = challenge.get("opaque");
+        if (opaque != null) {
+            sb.append(", ");
+            appendQuoted(sb, "opaque", opaque);
+        }
+        if (qop != null) {
+            sb.append(", qop=").append(qop);
+            sb.append(", nc=").append(nc);
+            sb.append(", ");
+            appendQuoted(sb, "cnonce", cnonce);
+        }
+        if (userhash) {
+            sb.append(", userhash=true");
+        }
+        if (charset.equals(StandardCharsets.UTF_8)) {
+            sb.append(", charset=utf-8");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Append a quoted Digest header parameter, escaping quotes.
+     *
+     * @param sb target
+     * @param name parameter name
+     * @param value parameter value
+     * @return the target
+     */
+    private static StringBuilder appendQuoted(final StringBuilder sb,
+            final String name, final String value) {
+        sb.append(name).append("=\"");
+        for (int i = 0; i < value.length(); i++) {
+            final char c = value.charAt(i);
+            if (c == '"' || c == '\\') {
+                sb.append('\\');
+            }
+            sb.append(c);
+        }
+        sb.append('"');
+        return sb;
     }
 
     /**
@@ -747,10 +1221,126 @@ public class Get extends Task {
         }
 
         private URLConnection openConnection(final URL aSource, final String uname,
-                                             final String pword) throws IOException {
+                                              final String pword) throws IOException {
 
-            // set up the URL connection
-            final URLConnection connection = aSource.openConnection();
+            URL current = aSource;
+            String currentUser = uname;
+            String currentPassword = pword;
+            String digestAuth = null;
+            boolean digestAttempted = false;
+
+            while (true) {
+                final URLConnection connection = current.openConnection();
+                configureConnection(connection, current, currentUser,
+                    currentPassword, digestAuth);
+                // connect to the remote site (may take some time)
+                try {
+                    connection.connect();
+                } catch (final NullPointerException e) {
+                    //bad URLs can trigger NPEs in some JVMs
+                    throw new BuildException(
+                        "Failed to parse " + source.toString(), e);
+                }
+
+                // non HTTP connections need no further handling
+                if (!(connection instanceof HttpURLConnection)) {
+                    return connection;
+                }
+
+                final HttpURLConnection httpConnection =
+                    (HttpURLConnection) connection;
+                final int responseCode = httpConnection.getResponseCode();
+
+                // First check on a 301 / 302 (moved) response (HTTP only)
+                if (isMoved(responseCode)) {
+                    final String newLocation =
+                        httpConnection.getHeaderField("Location");
+                    final String message = current
+                            + (responseCode == HttpURLConnection.HTTP_MOVED_PERM
+                                ? " permanently" : "")
+                            + " moved to " + newLocation;
+                    log(message, logLevel);
+                    final URL newURL = new URL(current, newLocation);
+                    if (!redirectionAllowed(current, newURL)) {
+                        return null;
+                    }
+                    final String[] forwarded =
+                        redirectCredentials(current, newURL, currentUser,
+                            currentPassword);
+                    current = newURL;
+                    currentUser = forwarded[0];
+                    currentPassword = forwarded[1];
+                    digestAuth = null;
+                    digestAttempted = false;
+                    continue;
+                }
+                // next test for a 304 result (HTTP only)
+                final long lastModified = httpConnection.getLastModified();
+                if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED
+                        || (lastModified != 0 && hasTimestamp
+                            && timestamp >= lastModified)) {
+                    // not modified so no file download. just return
+                    // instead and trace out something so the user
+                    // doesn't think that the download happened when it
+                    // didn't
+                    log("Not modified - so not downloaded", logLevel);
+                    return null;
+                }
+                // test for 401 result (HTTP only): answer a Digest
+                // challenge when credentials are available
+                if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED
+                    && !digestAttempted) {
+                    digestAttempted = true;
+                    digestAuth = tryDigestAuth(current, currentUser,
+                        currentPassword, connection);
+                    if (digestAuth != null) {
+                        httpConnection.disconnect();
+                        continue;
+                    }
+                }
+                if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                    final List<String> challenges =
+                        getAuthenticateHeaders(connection);
+                    final StringBuilder message = new StringBuilder(
+                        "HTTP Authorization failure for ").append(current);
+                    if (!challenges.isEmpty()) {
+                        for (final String challenge : challenges) {
+                            log(challenge, logLevel);
+                        }
+                        message.append(" (");
+                        message.append(String.join(", ", challenges));
+                        message.append(")");
+                    }
+                    if (ignoreErrors) {
+                        log(message.toString(), logLevel);
+                        return null;
+                    }
+                    throw new BuildException(message.toString());
+                }
+
+                //REVISIT: at this point even non HTTP connections may
+                //support the if-modified-since behaviour -we just check
+                //the date of the content and skip the write if it is not
+                //newer. Some protocols (FTP) don't include dates, of
+                //course.
+                return connection;
+            }
+        }
+
+        /**
+         * Set all request properties (authentication, user agent and
+         * custom headers) on a fresh connection.
+         *
+         * @param connection the connection to configure
+         * @param aSource the URL being fetched, may carry userInfo
+         * @param uname configured username, may be null
+         * @param pword configured password, may be null
+         * @param digestAuth computed Digest authorization header value,
+         *        or null to use preemptive Basic authentication
+         */
+        private void configureConnection(final URLConnection connection,
+                final URL aSource, final String uname, final String pword,
+                final String digestAuth) {
             // modify the headers
             // NB: things like user authentication could go in here too.
             if (hasTimestamp) {
@@ -759,20 +1349,26 @@ public class Get extends Task {
             // Set the user agent
             connection.addRequestProperty("User-Agent", this.userAgent);
 
-            // prepare Java 1.1 style credentials
-            if (uname != null || pword != null) {
-                final String up = uname + ":" + pword;
-                String encoding;
-                // we do not use the sun impl for portability,
-                // and always use our own implementation for consistent
-                // testing
-                final Base64Converter encoder = new Base64Converter();
-                encoding = encoder.encode(up.getBytes());
-                connection.setRequestProperty("Authorization", "Basic " + encoding);
+            if (digestAuth != null) {
+                connection.setRequestProperty("Authorization", digestAuth);
+            } else {
+                // prepare Basic Auth credentials. Explicit
+                // username/password attributes win; otherwise fall back
+                // to userInfo embedded in the URL
+                // (http://user:pass@host/...).
+                // We do not use the sun impl for portability, and always
+                // use our own implementation for consistent testing.
+                final String credentials =
+                    getBasicAuthCredentials(aSource, uname, pword);
+                if (credentials != null) {
+                    connection.setRequestProperty("Authorization",
+                        "Basic " + encodeBasicAuth(credentials));
+                }
             }
 
             if (tryGzipEncoding) {
-                connection.setRequestProperty("Accept-Encoding", GZIP_CONTENT_ENCODING);
+                connection.setRequestProperty("Accept-Encoding",
+                    GZIP_CONTENT_ENCODING);
             }
 
             for (final Map.Entry<String, String> header : headers.entrySet()) {
@@ -785,60 +1381,71 @@ public class Get extends Task {
                 ((HttpURLConnection) connection).setInstanceFollowRedirects(false);
                 connection.setUseCaches(httpUseCaches);
             }
-            // connect to the remote site (may take some time)
-            try {
-                connection.connect();
-            } catch (final NullPointerException e) {
-                //bad URLs can trigger NPEs in some JVMs
-                throw new BuildException("Failed to parse " + source.toString(), e);
-            }
+        }
 
-            // First check on a 301 / 302 (moved) response (HTTP only)
-            if (connection instanceof HttpURLConnection) {
-                final HttpURLConnection httpConnection = (HttpURLConnection) connection;
-                final int responseCode = httpConnection.getResponseCode();
-                if (isMoved(responseCode)) {
-                    final String newLocation = httpConnection.getHeaderField("Location");
-                    final String message = aSource
-                            + (responseCode == HttpURLConnection.HTTP_MOVED_PERM ? " permanently"
-                                    : "") + " moved to " + newLocation;
-                    log(message, logLevel);
-                    final URL newURL = new URL(aSource, newLocation);
-                    if (!redirectionAllowed(aSource, newURL)) {
-                        return null;
-                    }
-                    return openConnection(newURL,
-                        authenticateOnRedirect ? uname : null,
-                        authenticateOnRedirect ? pword : null);
-                }
-                // next test for a 304 result (HTTP only)
-                final long lastModified = httpConnection.getLastModified();
-                if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED
-                        || (lastModified != 0 && hasTimestamp && timestamp >= lastModified)) {
-                    // not modified so no file download. just return
-                    // instead and trace out something so the user
-                    // doesn't think that the download happened when it
-                    // didn't
-                    log("Not modified - so not downloaded", logLevel);
-                    return null;
-                }
-                // test for 401 result (HTTP only)
-                if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
-                    final String message = "HTTP Authorization failure";
-                    if (ignoreErrors) {
-                        log(message, logLevel);
-                        return null;
-                    }
-                    throw new BuildException(message);
-                }
+        /**
+         * Compute the credentials forwarded when following a redirect.
+         *
+         * <p>Credentials are only forwarded when explicitly allowed via
+         * {@code authenticateOnRedirect}. If the redirect target carries
+         * its own userInfo, no credentials are forwarded so that the
+         * target's userInfo takes precedence.</p>
+         *
+         * @param from the URL being redirected away from
+         * @param to the redirect target
+         * @param uname configured username, may be null
+         * @param pword configured password, may be null
+         * @return two element array with username and password to use
+         *         for the target (elements may be null)
+         */
+        private String[] redirectCredentials(final URL from, final URL to,
+                final String uname, final String pword) {
+            if (!authenticateOnRedirect || to.getUserInfo() != null) {
+                return new String[] {null, null};
             }
+            final String[] effective = splitUserInfo(
+                getBasicAuthCredentials(from, uname, pword));
+            return effective != null ? effective
+                : new String[] {null, null};
+        }
 
-            //REVISIT: at this point even non HTTP connections may
-            //support the if-modified-since behaviour -we just check
-            //the date of the content and skip the write if it is not
-            //newer. Some protocols (FTP) don't include dates, of
-            //course.
-            return connection;
+        /**
+         * Answer an HTTP Digest challenge for the failed request.
+         *
+         * @param aSource the URL being fetched
+         * @param uname configured username, may be null
+         * @param pword configured password, may be null
+         * @param failedConnection the connection that got the 401
+         * @return Digest authorization header value, or null when there
+         *         is no Digest challenge, no credentials or the
+         *         challenge cannot be answered
+         */
+        private String tryDigestAuth(final URL aSource, final String uname,
+                final String pword, final URLConnection failedConnection) {
+            final String digestChallenge =
+                selectDigestChallenge(getAuthenticateHeaders(failedConnection));
+            if (digestChallenge == null) {
+                return null;
+            }
+            final String[] credentials = splitUserInfo(
+                getBasicAuthCredentials(aSource, uname, pword));
+            if (credentials == null) {
+                return null;
+            }
+            final Map<String, String> challenge =
+                parseDigestChallenge(digestChallenge);
+            if (challenge == null || challenge.get("realm") == null
+                || challenge.get("nonce") == null) {
+                return null;
+            }
+            final String auth = buildDigestAuthorization(credentials[0],
+                credentials[1], "GET", getDigestUri(aSource), challenge,
+                "00000001", generateCnonce());
+            if (auth != null) {
+                log("Retrying with Digest authentication for " + aSource,
+                    logLevel);
+            }
+            return auth;
         }
 
         private boolean downloadFile() throws IOException {
